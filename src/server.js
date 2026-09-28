@@ -1,73 +1,63 @@
 import { WebSocketServer } from 'ws'
 import { nanoid } from 'nanoid'
 
-const server = new WebSocketServer({
-    port: 8080
-})
+const server = new WebSocketServer({ port: 8080 })
+const players = new Map()          // ws -> {id, x, y, score}
+const collected_coins = new Set() // coin ids — authoritative state
 
-const players = new Map()
-const collected_coins = new Map()
+const send = (ws, obj) => ws.readyState === 1 && ws.send(JSON.stringify(obj))
 
-console.log("Server started on port 8080")
+function broadcast(obj, exclude = null) {
+    for (const client of players.keys()) {
+        if (client !== exclude) send(client, obj)
+    }
+}
 
 server.on('connection', ws => {
-    console.log("Client connected")
+    const player = { id: nanoid(8), x: 0, y: 0, score: 0 }
+    players.set(ws, player)
+    console.log("Player", player.id, "joined")
 
-    players.set(ws,
-        {
-            id: nanoid(8),
-            x: 0,
-            y: 0,
-            score: 0
-        }
-    )
+    broadcast({ action: 'player_joined', id: player.id, x: 0, y: 0 }, ws)
 
-    console.log("Player", players.get(ws).id, " Joined")
+    ws.on('message', raw => {
+        let data
+        try { data = JSON.parse(raw) } catch { return }
+        if (typeof data?.action !== 'string') return
 
-    ws.on('message', message => {
-        const data = JSON.parse(message);
+        switch (data.action) {
+            case 'login':
+                send(ws, {
+                    action: 'login',
+                    uuid: player.id,
+                    players: [...players.values()],           // now plain objects
+                    coins: [...collected_coins]               // ← late join gets coin state
+                })
+                break
 
-        if (data.action === "login") {
-            ws.send(JSON.stringify({
-                action: "login",
-                uuid: players.get(ws).id,
-                players: [...players.entries()]
-            }))
-        } else if (data.action === "move") {
-            // Update player position
-            players.get(ws).x = data.x;
-            players.get(ws).y = data.y;
+            case 'move':
+                if (!Number.isFinite(data.x) || !Number.isFinite(data.y)) return
+                player.x = data.x
+                player.y = data.y
+                broadcast({ action: 'move', id: player.id, x: player.x, y: player.y })
+                break
 
-            ws.send(JSON.stringify({
-                action: "move",
-                uuid: players.get(ws).id,
-                players: [...players.entries()]
-            }))
-        } else if (data.action === "collect_coin") {
-            console.log("Player collected a coin #" + data.id)
-
-            players.get(ws).score++
-
-            for (const [key, value] of players.entries()) {
-                key.send(JSON.stringify({
-                    action: "coin_success",
-                    id: data.id,
-                }))
+            case 'collect_coin': {
+                const id = data.id | 0
+                if (collected_coins.has(id)) return           // ← duplicate/cheat rejected
+                collected_coins.add(id)
+                player.score++
+                broadcast({ action: 'coin_success', id, by: player.id })
+                break
             }
         }
     })
 
     ws.on('close', () => {
-        console.log("Client disconnected")
-
-        ws.send(JSON.stringify({
-            action: "disconnect",
-        }))
-
         players.delete(ws)
+        console.log("Player", player.id, "left")
+        broadcast({ action: 'player_left', id: player.id })   // tell the others
     })
 })
 
-server.on('error', error => {
-    console.error("Server error:", error)
-})
+server.on('error', e => console.error("Server error:", e))
